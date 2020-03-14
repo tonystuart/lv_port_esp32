@@ -1,11 +1,4 @@
-/* SPI Master example
 
-   This example code is in the Public Domain (or CC0 licensed, at your option.)
-
-   Unless required by applicable law or agreed to in writing, this
-   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-   CONDITIONS OF ANY KIND, either express or implied.
-*/
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,14 +28,6 @@
 #define ILI9341_RST  CONFIG_LVGL_DISP_PIN_RST
 #define ILI9341_BCKL CONFIG_LVGL_DISP_PIN_BCKL
 
-#define ILI9341_ENABLE_BACKLIGHT_CONTROL CONFIG_LVGL_ENABLE_BACKLIGHT_CONTROL
-
-#if CONFIG_LVGL_BACKLIGHT_ACTIVE_LVL
-  #define ILI9341_BCKL_ACTIVE_LVL 1
-#else
-  #define ILI9341_BCKL_ACTIVE_LVL 0
-#endif
-
 // if text/images are backwards, try setting this to 1
 #define ILI9341_INVERT_DISPLAY CONFIG_LVGL_INVERT_DISPLAY
 
@@ -67,18 +52,7 @@ static transaction_cb_t chained_post_cb;
 
 static void ili9341_enable_backlight(bool backlight)
 {
-#if ILI9341_ENABLE_BACKLIGHT_CONTROL
-    printf("%s backlight.\n", backlight ? "Enabling" : "Disabling");
-    uint32_t tmp = 0;
-
-#if (ILI9341_BCKL_ACTIVE_LVL==1)
-    tmp = backlight ? 1 : 0;
-#else
-    tmp = backlight ? 0 : 1;
-#endif
-
-    gpio_set_level(ILI9341_BCKL, tmp);
-#endif
+    gpio_set_level(ILI9341_BCKL, backlight);
 }
 
 static bool disp_spi_is_busy(void)
