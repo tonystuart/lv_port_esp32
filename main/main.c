@@ -164,23 +164,11 @@ static void ili9341_init(void)
 	}
 
 	ili9341_enable_backlight(true);
-
-#if ILI9341_INVERT_DISPLAY
-	uint8_t data[] = {0x68};
-	// this same command also sets rotation (portrait/landscape) and inverts colors.
-	// https://gist.github.com/motters/38a26a66020f674b6389063932048e4c#file-ili9844_defines-h-L24
-	ili9341_send_cmd(0x36);
-	ili9341_send_data(&data, 1);
-#endif
 }
 
 void disp_driver_init(void)
 {
-#if CONFIG_LVGL_TFT_DISPLAY_CONTROLLER == 0
         ili9341_init();
-#elif CONFIG_LVGL_TFT_DISPLAY_CONTROLLER == 1
-            ili9488_init();
-#endif
 }
 
 static void ili9341_flush(lv_disp_drv_t * drv, const lv_area_t * area, lv_color_t * color_map)
@@ -214,12 +202,9 @@ static void ili9341_flush(lv_disp_drv_t * drv, const lv_area_t * area, lv_color_
 
 void disp_driver_flush(lv_disp_drv_t * drv, const lv_area_t * area, lv_color_t * color_map)
 {
-#if CONFIG_LVGL_TFT_DISPLAY_CONTROLLER == 0
-        ili9341_flush(drv, area, color_map);
-#elif CONFIG_LVGL_TFT_DISPLAY_CONTROLLER == 1
-            ili9488_flush(drv, area, color_map);
-#endif
+    ili9341_flush(drv, area, color_map);
 }
+
 static void ili9341_send_cmd(uint8_t cmd)
 {
 	  while(disp_spi_is_busy()) {}
@@ -274,11 +259,7 @@ static void disp_spi_init(void)
             .sclk_io_num=DISP_SPI_CLK,
             .quadwp_io_num=-1,
             .quadhd_io_num=-1,
-#if CONFIG_LVGL_TFT_DISPLAY_CONTROLLER == 0
             .max_transfer_sz = DISP_BUF_SIZE * 2,
-#elif CONFIG_LVGL_TFT_DISPLAY_CONTROLLER == 1
-            .max_transfer_sz = DISP_BUF_SIZE * 3,
-#endif
     };
 
     //Initialize the SPI bus
@@ -301,9 +282,11 @@ static void IRAM_ATTR spi_ready (spi_transaction_t *trans)
 
 static void IRAM_ATTR lv_tick_task(void);
 
-#if CONFIG_LVGL_TOUCH_CONTROLLER == 1 && TP_SPI_MOSI == DISP_SPI_MOSI && TP_SPI_CLK == DISP_SPI_CLK
 static void configure_shared_spi_bus()
 {
+    assert(TP_SPI_MOSI == DISP_SPI_MOSI);
+    assert(TP_SPI_CLK == DISP_SPI_CLK);
+
     spi_bus_config_t buscfg = {
         .miso_io_num = TP_SPI_MISO,
         .mosi_io_num = TP_SPI_MOSI,
@@ -340,25 +323,11 @@ static void configure_shared_spi_bus()
     tp_spi_add_device_config(HSPI_HOST, &xpt2046_config);
     xpt2046_init();
 }
-#endif
 
 void app_main() {
     lv_init();
 
-#if CONFIG_LVGL_TOUCH_CONTROLLER == 1 && TP_SPI_MOSI == DISP_SPI_MOSI && TP_SPI_CLK == DISP_SPI_CLK
     configure_shared_spi_bus();
-#else
-    disp_spi_init();
-    disp_driver_init();
-
-#if CONFIG_LVGL_TOUCH_CONTROLLER == 1
-    tp_spi_init();
-    xpt2046_init();
-#elif CONFIG_LVGL_TOUCH_CONTROLLER == 2
-    ft6x06_init(FT6236_I2C_SLAVE_ADDR);
-#endif
-#endif
-
     static lv_color_t buf1[DISP_BUF_SIZE];
     static lv_color_t buf2[DISP_BUF_SIZE];
     static lv_disp_buf_t disp_buf;
@@ -370,19 +339,11 @@ void app_main() {
     disp_drv.buffer = &disp_buf;
     lv_disp_drv_register(&disp_drv);
 
-#if CONFIG_LVGL_TOUCH_CONTROLLER == 1
     lv_indev_drv_t indev_drv;
     lv_indev_drv_init(&indev_drv);
     indev_drv.read_cb = xpt2046_read;
     indev_drv.type = LV_INDEV_TYPE_POINTER;
     lv_indev_drv_register(&indev_drv);
-#elif CONFIG_LVGL_TOUCH_CONTROLLER == 2
-    lv_indev_drv_t indev_drv;
-    lv_indev_drv_init(&indev_drv);
-    indev_drv.read_cb = ft6x36_touch_xy;
-    indev_drv.type = LV_INDEV_TYPE_POINTER;
-    lv_indev_drv_register(&indev_drv);
-#endif
 
     esp_register_freertos_tick_hook(lv_tick_task);
 
