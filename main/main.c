@@ -41,7 +41,6 @@ static void IRAM_ATTR spi_ready (spi_transaction_t *trans);
 static spi_device_handle_t ili9341_spi;
 static volatile bool spi_trans_in_progress;
 static volatile bool spi_color_sent;
-static transaction_cb_t chained_post_cb;
 
 static void configure_gpio_output(uint8_t pin)
 {
@@ -208,7 +207,6 @@ static void ili9341_flush(lv_disp_drv_t * drv, const lv_area_t * area, lv_color_
 
 static void disp_spi_add_device_config(spi_host_device_t host, spi_device_interface_config_t *devcfg)
 {
-    chained_post_cb=devcfg->post_cb;
     devcfg->post_cb=spi_ready;
     esp_err_t ret=spi_bus_add_device(host, devcfg, &ili9341_spi);
     assert(ret==ESP_OK);
@@ -220,7 +218,6 @@ static void IRAM_ATTR spi_ready (spi_transaction_t *trans)
 
     lv_disp_t * disp = lv_refr_get_disp_refreshing();
     if(spi_color_sent) lv_disp_flush_ready(&disp->driver);
-    if(chained_post_cb) chained_post_cb(trans);
 }
 
 static void IRAM_ATTR lv_tick_task(void);
