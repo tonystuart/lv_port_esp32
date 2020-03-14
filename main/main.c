@@ -36,16 +36,23 @@ typedef struct {
     uint8_t databytes; //No of data in data; bit 7 = delay after set; 0xFF = end of cmds.
 } lcd_init_cmd_t;
 
-static void ili9341_send_cmd(uint8_t cmd);
-static void ili9341_send_data(void * data, uint16_t length);
-static void ili9341_send_color(void * data, uint16_t length);
-
 static void IRAM_ATTR spi_ready (spi_transaction_t *trans);
 
 static spi_device_handle_t ili9341_spi;
 static volatile bool spi_trans_in_progress;
 static volatile bool spi_color_sent;
 static transaction_cb_t chained_post_cb;
+
+static void configure_gpio_output(uint8_t pin)
+{
+    gpio_config_t io_conf;
+    io_conf.intr_type = GPIO_PIN_INTR_DISABLE;
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    io_conf.pin_bit_mask = 1 << pin;
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+    gpio_config(&io_conf);
+}
 
 static void ili9341_enable_backlight(bool backlight)
 {
@@ -93,15 +100,25 @@ static void disp_spi_send_colors(uint8_t * data, uint16_t length)
     spi_device_get_trans_result(ili9341_spi,&ta, portMAX_DELAY);
 }
 
-static void configure_gpio_output(uint8_t pin)
+static void ili9341_send_cmd(uint8_t cmd)
 {
-    gpio_config_t io_conf;
-    io_conf.intr_type = GPIO_PIN_INTR_DISABLE;
-    io_conf.mode = GPIO_MODE_OUTPUT;
-    io_conf.pin_bit_mask = 1 << pin;
-    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-    gpio_config(&io_conf);
+    while(disp_spi_is_busy()) {}
+    gpio_set_level(ILI9341_DC, 0);	 /*Command mode*/
+    disp_spi_send_data(&cmd, 1);
+}
+
+static void ili9341_send_data(void * data, uint16_t length)
+{
+    while(disp_spi_is_busy()) {}
+    gpio_set_level(ILI9341_DC, 1);	 /*Data mode*/
+    disp_spi_send_data(data, length);
+}
+
+static void ili9341_send_color(void * data, uint16_t length)
+{
+    while(disp_spi_is_busy()) {}
+    gpio_set_level(ILI9341_DC, 1);   /*Data mode*/
+    disp_spi_send_colors(data, length);
 }
 
 static void ili9341_init(void)
@@ -161,11 +178,6 @@ static void ili9341_init(void)
     ili9341_enable_backlight(true);
 }
 
-void disp_driver_init(void)
-{
-    ili9341_init();
-}
-
 static void ili9341_flush(lv_disp_drv_t * drv, const lv_area_t * area, lv_color_t * color_map)
 {
     uint8_t data[4];
@@ -194,32 +206,6 @@ static void ili9341_flush(lv_disp_drv_t * drv, const lv_area_t * area, lv_color_
     ili9341_send_color((void*)color_map, size * 2);
 }
 
-void disp_driver_flush(lv_disp_drv_t * drv, const lv_area_t * area, lv_color_t * color_map)
-{
-    ili9341_flush(drv, area, color_map);
-}
-
-static void ili9341_send_cmd(uint8_t cmd)
-{
-    while(disp_spi_is_busy()) {}
-    gpio_set_level(ILI9341_DC, 0);	 /*Command mode*/
-    disp_spi_send_data(&cmd, 1);
-}
-
-static void ili9341_send_data(void * data, uint16_t length)
-{
-    while(disp_spi_is_busy()) {}
-    gpio_set_level(ILI9341_DC, 1);	 /*Data mode*/
-    disp_spi_send_data(data, length);
-}
-
-static void ili9341_send_color(void * data, uint16_t length)
-{
-    while(disp_spi_is_busy()) {}
-    gpio_set_level(ILI9341_DC, 1);   /*Data mode*/
-    disp_spi_send_colors(data, length);
-}
-
 static void disp_spi_add_device_config(spi_host_device_t host, spi_device_interface_config_t *devcfg)
 {
     chained_post_cb=devcfg->post_cb;
@@ -227,42 +213,6 @@ static void disp_spi_add_device_config(spi_host_device_t host, spi_device_interf
     esp_err_t ret=spi_bus_add_device(host, devcfg, &ili9341_spi);
     assert(ret==ESP_OK);
 }
-
-static void disp_spi_add_device(spi_host_device_t host)
-{
-    spi_device_interface_config_t devcfg={
-        .clock_speed_hz=40*1000*1000,           //Clock out at 40 MHz
-        .mode=0,                                //SPI mode 0
-        .spics_io_num=DISP_SPI_CS,              //CS pin
-        .queue_size=1,
-        .pre_cb=NULL,
-        .post_cb=NULL,
-        .flags = SPI_DEVICE_HALFDUPLEX
-    };
-    disp_spi_add_device_config(host, &devcfg);
-}
-
-static void disp_spi_init(void)
-{
-    esp_err_t ret;
-
-    spi_bus_config_t buscfg={
-        .miso_io_num=-1,
-        .mosi_io_num=DISP_SPI_MOSI,
-        .sclk_io_num=DISP_SPI_CLK,
-        .quadwp_io_num=-1,
-        .quadhd_io_num=-1,
-        .max_transfer_sz = DISP_BUF_SIZE * 2,
-    };
-
-    //Initialize the SPI bus
-    ret=spi_bus_initialize(HSPI_HOST, &buscfg, 1);
-    assert(ret==ESP_OK);
-
-    //Attach the LCD to the SPI bus
-    disp_spi_add_device(HSPI_HOST);
-}
-
 
 static void IRAM_ATTR spi_ready (spi_transaction_t *trans)
 {
@@ -302,7 +252,7 @@ static void configure_shared_spi_bus()
     };
 
     disp_spi_add_device_config(HSPI_HOST, &ili9341_config);
-    disp_driver_init();
+    ili9341_init();
 
     spi_device_interface_config_t xpt2046_config = {
         .clock_speed_hz = 2 * 1000 * 1000,
@@ -328,7 +278,7 @@ void app_main() {
 
     lv_disp_drv_t disp_drv;
     lv_disp_drv_init(&disp_drv);
-    disp_drv.flush_cb = disp_driver_flush;
+    disp_drv.flush_cb = ili9341_flush;
     disp_drv.buffer = &disp_buf;
     lv_disp_drv_register(&disp_drv);
 
