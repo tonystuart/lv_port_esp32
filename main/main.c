@@ -76,7 +76,6 @@ static void disp_spi_send_data(uint8_t * data, uint16_t length)
     spi_device_queue_trans(ili9341_spi, &t, portMAX_DELAY);
 	spi_transaction_t *ta = &t;
     spi_device_get_trans_result(ili9341_spi,&ta, portMAX_DELAY);
-
 }
 
 static void disp_spi_send_colors(uint8_t * data, uint16_t length)
@@ -95,6 +94,17 @@ static void disp_spi_send_colors(uint8_t * data, uint16_t length)
     spi_device_queue_trans(ili9341_spi, &t, portMAX_DELAY);
 	spi_transaction_t *ta = &t;
     spi_device_get_trans_result(ili9341_spi,&ta, portMAX_DELAY);
+}
+
+static void configure_gpio_output(uint8_t pin)
+{
+    gpio_config_t io_conf;
+    io_conf.intr_type = GPIO_PIN_INTR_DISABLE;
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    io_conf.pin_bit_mask = 1 << pin;
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+    gpio_config(&io_conf);
 }
 
 static void ili9341_init(void)
@@ -127,20 +137,10 @@ static void ili9341_init(void)
 		{0, {0}, 0xff},
 	};
 
-#if ILI9341_BCKL == 15
-	gpio_config_t io_conf;
-    io_conf.intr_type = GPIO_PIN_INTR_DISABLE;
-    io_conf.mode = GPIO_MODE_OUTPUT;
-    io_conf.pin_bit_mask = GPIO_SEL_15;
-    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-    gpio_config(&io_conf);
-#endif
-
 	//Initialize non-SPI GPIOs
-	gpio_set_direction(ILI9341_DC, GPIO_MODE_OUTPUT);
-	gpio_set_direction(ILI9341_RST, GPIO_MODE_OUTPUT);
-	gpio_set_direction(ILI9341_BCKL, GPIO_MODE_OUTPUT);
+	configure_gpio_output(ILI9341_DC);
+	configure_gpio_output(ILI9341_RST);
+	configure_gpio_output(ILI9341_BCKL);
 
 	//Reset the display
 	gpio_set_level(ILI9341_RST, 0);
