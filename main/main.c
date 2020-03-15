@@ -16,6 +16,8 @@
 
 #define TAG "MAIN"
 
+#define $ ESP_ERROR_CHECK
+
 #define DISP_SPI_MOSI CONFIG_LVGL_DISP_SPI_MOSI
 #define DISP_SPI_CLK CONFIG_LVGL_DISP_SPI_CLK
 #define DISP_SPI_CS CONFIG_LVGL_DISP_SPI_CS
@@ -49,16 +51,15 @@ static void configure_gpio(uint8_t pin, gpio_mode_t mode)
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .intr_type = GPIO_PIN_INTR_DISABLE,
     };
-    esp_err_t ret = gpio_config(&io_conf);
-    assert(ret == ESP_OK);
+    $(gpio_config(&io_conf));
 }
 
 static void IRAM_ATTR pre_cb(spi_transaction_t *trans)
 {
     if ((uint32_t)trans->user & DATA_MODE) {
-        gpio_set_level(ILI9341_DC, 1);	 // data mode
+        $(gpio_set_level(ILI9341_DC, 1));	 // data mode
     } else {
-        gpio_set_level(ILI9341_DC, 0);	 // command mode
+        $(gpio_set_level(ILI9341_DC, 0));	 // command mode
     }
 }
 
@@ -86,13 +87,13 @@ static void disp_spi_send(uint8_t *data, uint16_t length, uint32_t flags)
     t->length = length * 8;
     t->tx_buffer = data;
     t->user = (void*)flags;
-    spi_device_queue_trans(ili9341_spi, t, portMAX_DELAY);
+    $(spi_device_queue_trans(ili9341_spi, t, portMAX_DELAY));
     next_transaction = (next_transaction + 1) % MAX_CONCURRENT_TRANSACTIONS;
 }
 
 static void ili9341_enable_backlight(bool backlight)
 {
-    gpio_set_level(ILI9341_BCKL, backlight);
+    $(gpio_set_level(ILI9341_BCKL, backlight));
 }
 
 static void ili9341_send_cmd(uint8_t cmd)
@@ -146,9 +147,9 @@ static void ili9341_init(void)
     configure_gpio(ILI9341_BCKL, GPIO_MODE_OUTPUT);
 
     //Reset the display
-    gpio_set_level(ILI9341_RST, 0);
+    $(gpio_set_level(ILI9341_RST, 0));
     vTaskDelay(100 / portTICK_RATE_MS);
-    gpio_set_level(ILI9341_RST, 1);
+    $(gpio_set_level(ILI9341_RST, 1));
     vTaskDelay(100 / portTICK_RATE_MS);
 
     ESP_LOGI(TAG, "sending ili9341 initialization commands");
@@ -229,14 +230,13 @@ static void tp_spi_xchg(uint8_t data_send[], uint8_t data_recv[], uint8_t byte_c
         .tx_buffer = data_send,
         .rx_buffer = data_recv};
 
-    esp_err_t ret = spi_device_queue_trans(xpt2046_spi, &t, portMAX_DELAY);
-    assert(ret == ESP_OK);
+    $(spi_device_queue_trans(xpt2046_spi, &t, portMAX_DELAY));
 
     spi_transaction_t *rt;
-    ret = spi_device_get_trans_result(xpt2046_spi, &rt, portMAX_DELAY);
-    assert(ret == ESP_OK);
+    $(spi_device_get_trans_result(xpt2046_spi, &rt, portMAX_DELAY));
     assert(&t == rt);
 }
+
 static int16_t avg_buf_x[XPT2046_AVG];
 static int16_t avg_buf_y[XPT2046_AVG];
 static uint8_t avg_last;
@@ -353,8 +353,7 @@ static void configure_shared_spi_bus()
         .max_transfer_sz = DISP_BUF_SIZE * 2,
     };
 
-    esp_err_t ret = spi_bus_initialize(HSPI_HOST, &buscfg, 1);
-    assert(ret == ESP_OK);
+    $(spi_bus_initialize(HSPI_HOST, &buscfg, 1));
 
     spi_device_interface_config_t ili9341_config = {
         .clock_speed_hz = 20 * 1000 * 1000,
@@ -365,8 +364,7 @@ static void configure_shared_spi_bus()
         .post_cb = post_cb
     };
 
-    ret = spi_bus_add_device(HSPI_HOST, &ili9341_config, &ili9341_spi);
-    assert(ret == ESP_OK);
+    $(spi_bus_add_device(HSPI_HOST, &ili9341_config, &ili9341_spi));
 
     ili9341_init();
 
@@ -379,7 +377,7 @@ static void configure_shared_spi_bus()
         .post_cb = NULL,
     };
 
-    ret = spi_bus_add_device(HSPI_HOST, &xpt2046_config, &xpt2046_spi);
+    $(spi_bus_add_device(HSPI_HOST, &xpt2046_config, &xpt2046_spi));
     xpt2046_init();
 }
 
