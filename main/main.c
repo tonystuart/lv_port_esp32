@@ -5,6 +5,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
+#include "esp_log.h"
 #include "driver/gpio.h"
 #include "lvgl/lvgl.h"
 #include "lv_examples/lv_apps/demo/demo.h"
@@ -18,6 +19,8 @@
 #include "driver/spi_master.h"
 #include <freertos/semphr.h>
 
+#define TAG "MAIN"
+
 #define DISP_SPI_MOSI CONFIG_LVGL_DISP_SPI_MOSI
 #define DISP_SPI_CLK CONFIG_LVGL_DISP_SPI_CLK
 #define DISP_SPI_CS CONFIG_LVGL_DISP_SPI_CS
@@ -30,7 +33,9 @@
 // if text/images are backwards, try setting this to 1
 #define ILI9341_INVERT_DISPLAY CONFIG_LVGL_INVERT_DISPLAY
 
-#define FLUSH_READY 0x01u
+#define DATA_MODE     0x01u
+#define COMMAND_MODE  0x02u
+#define FLUSH_READY   0x04u
 
 typedef struct {
     uint8_t cmd;
@@ -38,10 +43,7 @@ typedef struct {
     uint8_t databytes; //No of data in data; bit 7 = delay after set; 0xFF = end of cmds.
 } lcd_init_cmd_t;
 
-static void IRAM_ATTR spi_ready (spi_transaction_t *trans);
-
 static spi_device_handle_t ili9341_spi;
-static volatile bool spi_trans_in_progress;
 
 static void configure_gpio_output(uint8_t pin)
 {
@@ -59,65 +61,56 @@ static void ili9341_enable_backlight(bool backlight)
     gpio_set_level(ILI9341_BCKL, backlight);
 }
 
-static bool disp_spi_is_busy(void)
+static void IRAM_ATTR pre_cb(spi_transaction_t *trans)
 {
-    return spi_trans_in_progress;
+    if ((uint32_t)trans->user & DATA_MODE) {
+        gpio_set_level(ILI9341_DC, 1);	 // data mode
+    } else {
+        gpio_set_level(ILI9341_DC, 0);	 // command mode
+    }
 }
 
-static void disp_spi_send_data(uint8_t * data, uint16_t length)
+static void IRAM_ATTR post_cb(spi_transaction_t *trans)
 {
-    if (length == 0) return;           //no need to send anything
-
-    while(spi_trans_in_progress);
-
-    spi_transaction_t t = {
-        .length = length * 8, // transaction length is in bits
-        .tx_buffer = data
-    };
-
-    spi_trans_in_progress = true;
-    spi_device_queue_trans(ili9341_spi, &t, portMAX_DELAY);
-    spi_transaction_t *ta = &t;
-    spi_device_get_trans_result(ili9341_spi,&ta, portMAX_DELAY);
+    if((uint32_t)trans->user & FLUSH_READY) {
+        lv_disp_t * disp = lv_refr_get_disp_refreshing();
+        lv_disp_flush_ready(&disp->driver);
+    }
 }
 
-static void disp_spi_send_colors(uint8_t * data, uint16_t length)
+#define MAX_CONCURRENT_TRANSACTIONS 5
+
+static uint8_t next_transaction = 0;
+static spi_transaction_t transactions[MAX_CONCURRENT_TRANSACTIONS];
+
+static void disp_spi_send(uint8_t *data, uint16_t length, uint32_t flags)
 {
-    if (length == 0) return;           //no need to send anything
+    if (!length) {
+        return;
+    }
 
-    while(spi_trans_in_progress);
-
-    spi_transaction_t t = {
-        .length = length * 8, // transaction length is in bits
-        .tx_buffer = data,
-        .user = (void*)FLUSH_READY,
-    };
-
-    spi_trans_in_progress = true;
-    spi_device_queue_trans(ili9341_spi, &t, portMAX_DELAY);
-    spi_transaction_t *ta = &t;
-    spi_device_get_trans_result(ili9341_spi,&ta, portMAX_DELAY);
+    spi_transaction_t *t = &transactions[next_transaction];
+    memset(t, 0, sizeof(spi_transaction_t));
+    t->length = length * 8;
+    t->tx_buffer = data;
+    t->user = (void*)flags;
+    spi_device_queue_trans(ili9341_spi, t, portMAX_DELAY);
+    next_transaction = (next_transaction + 1) % MAX_CONCURRENT_TRANSACTIONS;
 }
 
 static void ili9341_send_cmd(uint8_t cmd)
 {
-    while(disp_spi_is_busy()) {}
-    gpio_set_level(ILI9341_DC, 0);	 /*Command mode*/
-    disp_spi_send_data(&cmd, 1);
+    disp_spi_send(&cmd, 1, COMMAND_MODE);
 }
 
 static void ili9341_send_data(void * data, uint16_t length)
 {
-    while(disp_spi_is_busy()) {}
-    gpio_set_level(ILI9341_DC, 1);	 /*Data mode*/
-    disp_spi_send_data(data, length);
+    disp_spi_send(data, length, DATA_MODE);
 }
 
 static void ili9341_send_color(void * data, uint16_t length)
 {
-    while(disp_spi_is_busy()) {}
-    gpio_set_level(ILI9341_DC, 1);   /*Data mode*/
-    disp_spi_send_colors(data, length);
+    disp_spi_send(data, length, DATA_MODE | FLUSH_READY);
 }
 
 static void ili9341_init(void)
@@ -161,7 +154,7 @@ static void ili9341_init(void)
     gpio_set_level(ILI9341_RST, 1);
     vTaskDelay(100 / portTICK_RATE_MS);
 
-    printf("ILI9341 initialization.\n");
+    ESP_LOGI(TAG, "sending ili9341 initialization commands");
 
     //Send all the commands
     uint16_t cmd = 0;
@@ -173,6 +166,8 @@ static void ili9341_init(void)
         }
         cmd++;
     }
+
+    ESP_LOGI(TAG, "ili9341 initialization commands sent");
 
     ili9341_enable_backlight(true);
 }
@@ -205,24 +200,9 @@ static void ili9341_flush(lv_disp_drv_t * drv, const lv_area_t * area, lv_color_
     ili9341_send_color((void*)color_map, size * 2);
 }
 
-static void disp_spi_add_device_config(spi_host_device_t host, spi_device_interface_config_t *devcfg)
-{
-    devcfg->post_cb=spi_ready;
-    esp_err_t ret=spi_bus_add_device(host, devcfg, &ili9341_spi);
-    assert(ret==ESP_OK);
+static void IRAM_ATTR lv_tick_task(void) {
+    lv_tick_inc(portTICK_RATE_MS);
 }
-
-static void IRAM_ATTR spi_ready (spi_transaction_t *trans)
-{
-    spi_trans_in_progress = false;
-
-    if((uint32_t)trans->user & FLUSH_READY) {
-        lv_disp_t * disp = lv_refr_get_disp_refreshing();
-        lv_disp_flush_ready(&disp->driver);
-    }
-}
-
-static void IRAM_ATTR lv_tick_task(void);
 
 static void configure_shared_spi_bus()
 {
@@ -246,11 +226,13 @@ static void configure_shared_spi_bus()
         .mode = 0,
         .spics_io_num = DISP_SPI_CS,
         .queue_size = 1,
-        .pre_cb = NULL,
-        .post_cb = NULL,
+        .pre_cb = pre_cb,
+        .post_cb = post_cb
     };
 
-    disp_spi_add_device_config(HSPI_HOST, &ili9341_config);
+    ret = spi_bus_add_device(HSPI_HOST, &ili9341_config, &ili9341_spi);
+    assert(ret == ESP_OK);
+
     ili9341_init();
 
     spi_device_interface_config_t xpt2046_config = {
@@ -297,6 +279,3 @@ void app_main() {
     }
 }
 
-static void IRAM_ATTR lv_tick_task(void) {
-    lv_tick_inc(portTICK_RATE_MS);
-}
