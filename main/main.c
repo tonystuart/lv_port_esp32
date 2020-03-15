@@ -11,11 +11,6 @@
 #include "lv_examples/lv_apps/demo/demo.h"
 #include "esp_freertos_hooks.h"
 
-#include "tp_spi.h"
-#include "xpt2046.h"
-#include "tp_i2c.h"
-#include "ft6x36.h"
-
 #include "driver/spi_master.h"
 #include <freertos/semphr.h>
 
@@ -56,11 +51,6 @@ static void configure_gpio_output(uint8_t pin)
     gpio_config(&io_conf);
 }
 
-static void ili9341_enable_backlight(bool backlight)
-{
-    gpio_set_level(ILI9341_BCKL, backlight);
-}
-
 static void IRAM_ATTR pre_cb(spi_transaction_t *trans)
 {
     if ((uint32_t)trans->user & DATA_MODE) {
@@ -96,6 +86,11 @@ static void disp_spi_send(uint8_t *data, uint16_t length, uint32_t flags)
     t->user = (void*)flags;
     spi_device_queue_trans(ili9341_spi, t, portMAX_DELAY);
     next_transaction = (next_transaction + 1) % MAX_CONCURRENT_TRANSACTIONS;
+}
+
+static void ili9341_enable_backlight(bool backlight)
+{
+    gpio_set_level(ILI9341_BCKL, backlight);
 }
 
 static void ili9341_send_cmd(uint8_t cmd)
@@ -204,6 +199,153 @@ static void IRAM_ATTR lv_tick_task(void) {
     lv_tick_inc(portTICK_RATE_MS);
 }
 
+#define CMD_X_READ  0b10010000
+#define CMD_Y_READ  0b11010000
+
+#define TP_SPI_MOSI CONFIG_LVGL_TOUCH_SPI_MOSI
+#define TP_SPI_MISO CONFIG_LVGL_TOUCH_SPI_MISO
+#define TP_SPI_CLK  CONFIG_LVGL_TOUCH_SPI_CLK
+#define TP_SPI_CS   CONFIG_LVGL_TOUCH_SPI_CS
+
+
+#define XPT2046_IRQ CONFIG_LVGL_TOUCH_PIN_IRQ
+
+#define XPT2046_AVG 4
+#define XPT2046_X_MIN       CONFIG_LVGL_TOUCH_X_MIN
+#define XPT2046_Y_MIN       CONFIG_LVGL_TOUCH_Y_MIN
+#define XPT2046_X_MAX       CONFIG_LVGL_TOUCH_X_MAX
+#define XPT2046_Y_MAX       CONFIG_LVGL_TOUCH_Y_MAX
+#define XPT2046_X_INV       CONFIG_LVGL_TOUCH_INVERT_X
+#define XPT2046_Y_INV       CONFIG_LVGL_TOUCH_INVERT_Y
+
+static spi_device_handle_t xpt2046_spi;
+
+static void tp_spi_xchg(uint8_t data_send[], uint8_t data_recv[], uint8_t byte_count)
+{
+    spi_transaction_t t = {
+        .length = byte_count * 8, // SPI transaction length is in bits
+        .tx_buffer = data_send,
+        .rx_buffer = data_recv};
+
+    esp_err_t ret = spi_device_queue_trans(xpt2046_spi, &t, portMAX_DELAY);
+    assert(ret == ESP_OK);
+
+    spi_transaction_t *rt;
+    ret = spi_device_get_trans_result(xpt2046_spi, &rt, portMAX_DELAY);
+    assert(ret == ESP_OK);
+    assert(&t == rt);
+}
+static int16_t avg_buf_x[XPT2046_AVG];
+static int16_t avg_buf_y[XPT2046_AVG];
+static uint8_t avg_last;
+
+static void xpt2046_init(void)
+{
+    gpio_config_t irq_config = {
+        .pin_bit_mask = 1UL << XPT2046_IRQ,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    esp_err_t ret = gpio_config(&irq_config);
+    assert(ret == ESP_OK);
+}
+
+static void xpt2046_corr(int16_t * x, int16_t * y)
+{
+    if((*x) > XPT2046_X_MIN)(*x) -= XPT2046_X_MIN;
+    else(*x) = 0;
+
+    if((*y) > XPT2046_Y_MIN)(*y) -= XPT2046_Y_MIN;
+    else(*y) = 0;
+
+    (*x) = (uint32_t)((uint32_t)(*x) * LV_HOR_RES) /
+        (XPT2046_X_MAX - XPT2046_X_MIN);
+
+    (*y) = (uint32_t)((uint32_t)(*y) * LV_VER_RES) /
+        (XPT2046_Y_MAX - XPT2046_Y_MIN);
+
+    (*x) =  LV_HOR_RES - (*x);
+
+    (*y) =  LV_VER_RES - (*y);
+}
+
+static void xpt2046_avg(int16_t * x, int16_t * y)
+{
+    /*Shift out the oldest data*/
+    uint8_t i;
+    for(i = XPT2046_AVG - 1; i > 0 ; i--) {
+        avg_buf_x[i] = avg_buf_x[i - 1];
+        avg_buf_y[i] = avg_buf_y[i - 1];
+    }
+
+    /*Insert the new point*/
+    avg_buf_x[0] = *x;
+    avg_buf_y[0] = *y;
+    if(avg_last < XPT2046_AVG) avg_last++;
+
+    /*Sum the x and y coordinates*/
+    int32_t x_sum = 0;
+    int32_t y_sum = 0;
+    for(i = 0; i < avg_last ; i++) {
+        x_sum += avg_buf_x[i];
+        y_sum += avg_buf_y[i];
+    }
+
+    /*Normalize the sums*/
+    (*x) = (int32_t)x_sum / avg_last;
+    (*y) = (int32_t)y_sum / avg_last;
+}
+
+static bool xpt2046_read(lv_indev_drv_t * drv, lv_indev_data_t * data)
+{
+    static int16_t last_x = 0;
+    static int16_t last_y = 0;
+    bool valid = true;
+
+    int16_t x = 0;
+    int16_t y = 0;
+
+    uint8_t irq = gpio_get_level(XPT2046_IRQ);
+
+    if (irq == 0) {
+        uint8_t data_send[] = {
+            CMD_X_READ,
+            0,
+            CMD_Y_READ,
+            0,
+            0
+        };
+        uint8_t data_recv[sizeof(data_send)] = {};
+        tp_spi_xchg(data_send, data_recv, sizeof(data_send));
+        x = data_recv[1] << 8 | data_recv[2];
+        y = data_recv[3] << 8 | data_recv[4];
+
+        /*Normalize Data*/
+        x = x >> 3;
+        y = y >> 3;
+        xpt2046_corr(&x, &y);
+        xpt2046_avg(&x, &y);
+        last_x = x;
+        last_y = y;
+
+    } else {
+        x = last_x;
+        y = last_y;
+        avg_last = 0;
+        valid = false;
+    }
+
+    data->point.x = x;
+    data->point.y = y;
+    data->state = valid == false ? LV_INDEV_STATE_REL : LV_INDEV_STATE_PR;
+
+    return false;
+}
+
+
 static void configure_shared_spi_bus()
 {
     assert(TP_SPI_MOSI == DISP_SPI_MOSI);
@@ -244,7 +386,7 @@ static void configure_shared_spi_bus()
         .post_cb = NULL,
     };
 
-    tp_spi_add_device_config(HSPI_HOST, &xpt2046_config);
+    ret = spi_bus_add_device(HSPI_HOST, &xpt2046_config, &xpt2046_spi);
     xpt2046_init();
 }
 
