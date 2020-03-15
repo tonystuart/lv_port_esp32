@@ -27,15 +27,14 @@
 #define ILI9341_RST  CONFIG_LVGL_DISP_PIN_RST
 #define ILI9341_BCKL CONFIG_LVGL_DISP_PIN_BCKL
 
-// if text/images are backwards, try setting this to 1
-#define ILI9341_INVERT_DISPLAY CONFIG_LVGL_INVERT_DISPLAY
-
 #define DATA_MODE     0x01u
 #define COMMAND_MODE  0x02u
 #define FLUSH_READY   0x04u
 
+#define LOW 0
+
 typedef struct {
-    uint8_t cmd;
+    uint8_t command;
     uint8_t data[16];
     uint8_t databytes; //No of data in data; bit 7 = delay after set; 0xFF = end of cmds.
 } lcd_init_cmd_t;
@@ -54,33 +53,33 @@ static void configure_gpio(uint8_t pin, gpio_mode_t mode)
     $(gpio_config(&io_conf));
 }
 
-static void IRAM_ATTR pre_cb(spi_transaction_t *trans)
+static void IRAM_ATTR pre_cb(spi_transaction_t *transaction)
 {
-    if ((uint32_t)trans->user & DATA_MODE) {
+    if ((uint32_t)transaction->user & DATA_MODE) {
         $(gpio_set_level(ILI9341_DC, 1));	 // data mode
     } else {
         $(gpio_set_level(ILI9341_DC, 0));	 // command mode
     }
 }
 
-static void IRAM_ATTR post_cb(spi_transaction_t *trans)
+static void IRAM_ATTR post_cb(spi_transaction_t *transaction)
 {
-    if((uint32_t)trans->user & FLUSH_READY) {
-        lv_disp_t * disp = lv_refr_get_disp_refreshing();
+    if((uint32_t)transaction->user & FLUSH_READY) {
+        lv_disp_t *disp = lv_refr_get_disp_refreshing();
         lv_disp_flush_ready(&disp->driver);
     }
 }
 
 #define MAX_CONCURRENT_TRANSACTIONS 5
 
-static uint8_t next_transaction = 0;
-static spi_transaction_t transactions[MAX_CONCURRENT_TRANSACTIONS];
-
 static void disp_spi_send(uint8_t *data, uint16_t length, uint32_t flags)
 {
     if (!length) {
         return;
     }
+
+    static uint8_t next_transaction = 0;
+    static spi_transaction_t transactions[MAX_CONCURRENT_TRANSACTIONS];
 
     spi_transaction_t *t = &transactions[next_transaction];
     memset(t, 0, sizeof(spi_transaction_t));
@@ -91,29 +90,24 @@ static void disp_spi_send(uint8_t *data, uint16_t length, uint32_t flags)
     next_transaction = (next_transaction + 1) % MAX_CONCURRENT_TRANSACTIONS;
 }
 
-static void ili9341_enable_backlight(bool backlight)
+static void ili9341_send_command(uint8_t command)
 {
-    $(gpio_set_level(ILI9341_BCKL, backlight));
+    disp_spi_send(&command, 1, COMMAND_MODE);
 }
 
-static void ili9341_send_cmd(uint8_t cmd)
-{
-    disp_spi_send(&cmd, 1, COMMAND_MODE);
-}
-
-static void ili9341_send_data(void * data, uint16_t length)
+static void ili9341_send_data(void *data, uint16_t length)
 {
     disp_spi_send(data, length, DATA_MODE);
 }
 
-static void ili9341_send_color(void * data, uint16_t length)
+static void ili9341_send_color(void *data, uint16_t length)
 {
     disp_spi_send(data, length, DATA_MODE | FLUSH_READY);
 }
 
 static void ili9341_init(void)
 {
-    lcd_init_cmd_t ili_init_cmds[]={
+    lcd_init_cmd_t commands[]={
         {0xCF, {0x00, 0x83, 0X30}, 3},
         {0xED, {0x64, 0x03, 0X12, 0X81}, 4},
         {0xE8, {0x85, 0x01, 0x79}, 3},
@@ -152,30 +146,30 @@ static void ili9341_init(void)
     $(gpio_set_level(ILI9341_RST, 1));
     vTaskDelay(100 / portTICK_RATE_MS);
 
-    ESP_LOGI(TAG, "sending ili9341 initialization commands");
+    ESP_LOGI(TAG, "Initializing ili9341");
 
     //Send all the commands
-    uint16_t cmd = 0;
-    while (ili_init_cmds[cmd].databytes!=0xff) {
-        ili9341_send_cmd(ili_init_cmds[cmd].cmd);
-        ili9341_send_data(ili_init_cmds[cmd].data, ili_init_cmds[cmd].databytes&0x1F);
-        if (ili_init_cmds[cmd].databytes & 0x80) {
+    uint16_t index = 0;
+    while (commands[index].databytes != 0xff) {
+        ili9341_send_command(commands[index].command);
+        ili9341_send_data(commands[index].data, commands[index].databytes & 0x1F);
+        if (commands[index].databytes & 0x80) {
             vTaskDelay(100 / portTICK_RATE_MS);
         }
-        cmd++;
+        index++;
     }
 
-    ESP_LOGI(TAG, "ili9341 initialization commands sent");
-
-    ili9341_enable_backlight(true);
+    if (ILI9341_BCKL != -1) {
+        $(gpio_set_level(ILI9341_BCKL, 1));
+    }
 }
 
-static void ili9341_flush(lv_disp_drv_t * drv, const lv_area_t * area, lv_color_t * color_map)
+static void ili9341_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
 {
     uint8_t data[4];
 
     /*Column addresses*/
-    ili9341_send_cmd(0x2A);
+    ili9341_send_command(0x2A);
     data[0] = (area->x1 >> 8) & 0xFF;
     data[1] = area->x1 & 0xFF;
     data[2] = (area->x2 >> 8) & 0xFF;
@@ -183,7 +177,7 @@ static void ili9341_flush(lv_disp_drv_t * drv, const lv_area_t * area, lv_color_
     ili9341_send_data(data, 4);
 
     /*Page addresses*/
-    ili9341_send_cmd(0x2B);
+    ili9341_send_command(0x2B);
     data[0] = (area->y1 >> 8) & 0xFF;
     data[1] = area->y1 & 0xFF;
     data[2] = (area->y2 >> 8) & 0xFF;
@@ -191,9 +185,9 @@ static void ili9341_flush(lv_disp_drv_t * drv, const lv_area_t * area, lv_color_
     ili9341_send_data(data, 4);
 
     /*Memory write*/
-    ili9341_send_cmd(0x2C);
+    ili9341_send_command(0x2C);
 
-    uint32_t size = lv_area_get_width(area) * lv_area_get_height(area);
+    uint32_t size = lv_area_get_width(area) *lv_area_get_height(area);
 
     ili9341_send_color((void*)color_map, size * 2);
 }
@@ -230,11 +224,7 @@ static void tp_spi_xchg(uint8_t data_send[], uint8_t data_recv[], uint8_t byte_c
         .tx_buffer = data_send,
         .rx_buffer = data_recv};
 
-    $(spi_device_queue_trans(xpt2046_spi, &t, portMAX_DELAY));
-
-    spi_transaction_t *rt;
-    $(spi_device_get_trans_result(xpt2046_spi, &rt, portMAX_DELAY));
-    assert(&t == rt);
+    $(spi_device_transmit(xpt2046_spi, &t));
 }
 
 static int16_t avg_buf_x[XPT2046_AVG];
@@ -246,26 +236,30 @@ static void xpt2046_init(void)
     configure_gpio(XPT2046_IRQ, GPIO_MODE_INPUT);
 }
 
-static void xpt2046_corr(int16_t * x, int16_t * y)
+static void xpt2046_corr(int16_t *x, int16_t *y)
 {
-    if((*x) > XPT2046_X_MIN)(*x) -= XPT2046_X_MIN;
-    else(*x) = 0;
+    if (*x > XPT2046_X_MIN) {
+        *x -= XPT2046_X_MIN;
+    }
+    else {
+        *x = 0;
+    }
 
-    if((*y) > XPT2046_Y_MIN)(*y) -= XPT2046_Y_MIN;
-    else(*y) = 0;
+    if (*y > XPT2046_Y_MIN) {
+        *y -= XPT2046_Y_MIN;
+    }
+    else {
+        *y = 0;
+    }
 
-    (*x) = (uint32_t)((uint32_t)(*x) * LV_HOR_RES) /
-        (XPT2046_X_MAX - XPT2046_X_MIN);
+    *x = (uint32_t)((uint32_t)*x * LV_HOR_RES) / (XPT2046_X_MAX - XPT2046_X_MIN);
+    *y = (uint32_t)((uint32_t)*y * LV_VER_RES) / (XPT2046_Y_MAX - XPT2046_Y_MIN);
 
-    (*y) = (uint32_t)((uint32_t)(*y) * LV_VER_RES) /
-        (XPT2046_Y_MAX - XPT2046_Y_MIN);
-
-    (*x) =  LV_HOR_RES - (*x);
-
-    (*y) =  LV_VER_RES - (*y);
+    *x =  LV_HOR_RES - *x;
+    *y =  LV_VER_RES - *y;
 }
 
-static void xpt2046_avg(int16_t * x, int16_t * y)
+static void xpt2046_avg(int16_t *x, int16_t *y)
 {
     /*Shift out the oldest data*/
     uint8_t i;
@@ -288,11 +282,11 @@ static void xpt2046_avg(int16_t * x, int16_t * y)
     }
 
     /*Normalize the sums*/
-    (*x) = (int32_t)x_sum / avg_last;
-    (*y) = (int32_t)y_sum / avg_last;
+    *x = (int32_t)x_sum / avg_last;
+    *y = (int32_t)y_sum / avg_last;
 }
 
-static bool xpt2046_read(lv_indev_drv_t * drv, lv_indev_data_t * data)
+static bool xpt2046_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
 {
     static int16_t last_x = 0;
     static int16_t last_y = 0;
@@ -301,9 +295,9 @@ static bool xpt2046_read(lv_indev_drv_t * drv, lv_indev_data_t * data)
     int16_t x = 0;
     int16_t y = 0;
 
-    uint8_t irq = gpio_get_level(XPT2046_IRQ);
+    uint8_t data_ready = gpio_get_level(XPT2046_IRQ) == LOW;
 
-    if (irq == 0) {
+    if (data_ready) {
         uint8_t data_send[] = {
             CMD_X_READ,
             0,
@@ -337,7 +331,6 @@ static bool xpt2046_read(lv_indev_drv_t * drv, lv_indev_data_t * data)
 
     return false;
 }
-
 
 static void configure_shared_spi_bus()
 {
