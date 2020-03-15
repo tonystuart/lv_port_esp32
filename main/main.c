@@ -1,3 +1,30 @@
+/* ESP-IDF LittlevGL Interface (ELI) for ILI9341 and XPT2046 with a shared SPI bus
+ *
+ * This code is derived from littlevgl/lv_port_esp32 which
+ * uses the following license and copyright statement:
+
+ * MIT License
+ *
+ * Copyright (c) 2019 Littlev Graphics Library
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -6,32 +33,29 @@
 #include "freertos/task.h"
 #include "esp_system.h"
 #include "esp_log.h"
+#include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "lvgl/lvgl.h"
-#include "lv_examples/lv_apps/demo/demo.h"
 #include "esp_freertos_hooks.h"
+#include "eli_ili9341_xpt2046.h"
 
-#include "driver/spi_master.h"
-#include <freertos/semphr.h>
-
-#define TAG "MAIN"
+#define TAG "ELI"
 
 #define $ ESP_ERROR_CHECK
 
-#define DISP_SPI_MOSI CONFIG_LVGL_DISP_SPI_MOSI
-#define DISP_SPI_CLK CONFIG_LVGL_DISP_SPI_CLK
-#define DISP_SPI_CS CONFIG_LVGL_DISP_SPI_CS
-
 #define DISP_BUF_SIZE (LV_HOR_RES_MAX * 40)
-#define ILI9341_DC   CONFIG_LVGL_DISP_PIN_DC
-#define ILI9341_RST  CONFIG_LVGL_DISP_PIN_RST
-#define ILI9341_BCKL CONFIG_LVGL_DISP_PIN_BCKL
+
+#define CMD_X_READ  0b10010000
+#define CMD_Y_READ  0b11010000
+
+#define XPT2046_AVG 4
 
 #define DATA_MODE     0x01u
 #define COMMAND_MODE  0x02u
 #define FLUSH_READY   0x04u
 
 #define LOW 0
+#define CONCURRENT_SPI_TRANSACTIONS 5
 
 typedef struct {
     uint8_t command;
@@ -40,6 +64,13 @@ typedef struct {
 } lcd_init_cmd_t;
 
 static spi_device_handle_t ili9341_spi;
+static spi_device_handle_t xpt2046_spi;
+
+static int16_t avg_buf_x[XPT2046_AVG];
+static int16_t avg_buf_y[XPT2046_AVG];
+static uint8_t avg_last;
+
+static eli_ili9341_xpt2046_config_t config;
 
 static void configure_gpio(uint8_t pin, gpio_mode_t mode)
 {
@@ -56,9 +87,9 @@ static void configure_gpio(uint8_t pin, gpio_mode_t mode)
 static void IRAM_ATTR pre_cb(spi_transaction_t *transaction)
 {
     if ((uint32_t)transaction->user & DATA_MODE) {
-        $(gpio_set_level(ILI9341_DC, 1));	 // data mode
+        $(gpio_set_level(config.dc, 1));	 // data mode
     } else {
-        $(gpio_set_level(ILI9341_DC, 0));	 // command mode
+        $(gpio_set_level(config.dc, 0));	 // command mode
     }
 }
 
@@ -70,8 +101,6 @@ static void IRAM_ATTR post_cb(spi_transaction_t *transaction)
     }
 }
 
-#define MAX_CONCURRENT_TRANSACTIONS 5
-
 static void disp_spi_send(uint8_t *data, uint16_t length, uint32_t flags)
 {
     if (!length) {
@@ -79,7 +108,7 @@ static void disp_spi_send(uint8_t *data, uint16_t length, uint32_t flags)
     }
 
     static uint8_t next_transaction = 0;
-    static spi_transaction_t transactions[MAX_CONCURRENT_TRANSACTIONS];
+    static spi_transaction_t transactions[CONCURRENT_SPI_TRANSACTIONS];
 
     spi_transaction_t *t = &transactions[next_transaction];
     memset(t, 0, sizeof(spi_transaction_t));
@@ -87,7 +116,7 @@ static void disp_spi_send(uint8_t *data, uint16_t length, uint32_t flags)
     t->tx_buffer = data;
     t->user = (void*)flags;
     $(spi_device_queue_trans(ili9341_spi, t, portMAX_DELAY));
-    next_transaction = (next_transaction + 1) % MAX_CONCURRENT_TRANSACTIONS;
+    next_transaction = (next_transaction + 1) % CONCURRENT_SPI_TRANSACTIONS;
 }
 
 static void ili9341_send_command(uint8_t command)
@@ -136,15 +165,16 @@ static void ili9341_init(void)
     };
 
     //Initialize non-SPI GPIOs
-    configure_gpio(ILI9341_DC, GPIO_MODE_OUTPUT);
-    configure_gpio(ILI9341_RST, GPIO_MODE_OUTPUT);
-    configure_gpio(ILI9341_BCKL, GPIO_MODE_OUTPUT);
+    configure_gpio(config.dc, GPIO_MODE_OUTPUT);
 
     //Reset the display
-    $(gpio_set_level(ILI9341_RST, 0));
-    vTaskDelay(100 / portTICK_RATE_MS);
-    $(gpio_set_level(ILI9341_RST, 1));
-    vTaskDelay(100 / portTICK_RATE_MS);
+    if (config.rst != -1) {
+        configure_gpio(config.rst, GPIO_MODE_OUTPUT);
+        $(gpio_set_level(config.rst, 0));
+        vTaskDelay(100 / portTICK_RATE_MS);
+        $(gpio_set_level(config.rst, 1));
+        vTaskDelay(100 / portTICK_RATE_MS);
+    }
 
     ESP_LOGI(TAG, "Initializing ili9341");
 
@@ -159,8 +189,10 @@ static void ili9341_init(void)
         index++;
     }
 
-    if (ILI9341_BCKL != -1) {
-        $(gpio_set_level(ILI9341_BCKL, 1));
+    //Turn on the display
+    if (config.bckl != -1) {
+        configure_gpio(config.bckl, GPIO_MODE_OUTPUT);
+        $(gpio_set_level(config.bckl, 1));
     }
 }
 
@@ -196,27 +228,6 @@ static void IRAM_ATTR lv_tick_task(void) {
     lv_tick_inc(portTICK_RATE_MS);
 }
 
-#define CMD_X_READ  0b10010000
-#define CMD_Y_READ  0b11010000
-
-#define TP_SPI_MOSI CONFIG_LVGL_TOUCH_SPI_MOSI
-#define TP_SPI_MISO CONFIG_LVGL_TOUCH_SPI_MISO
-#define TP_SPI_CLK  CONFIG_LVGL_TOUCH_SPI_CLK
-#define TP_SPI_CS   CONFIG_LVGL_TOUCH_SPI_CS
-
-
-#define XPT2046_IRQ CONFIG_LVGL_TOUCH_PIN_IRQ
-
-#define XPT2046_AVG 4
-#define XPT2046_X_MIN       CONFIG_LVGL_TOUCH_X_MIN
-#define XPT2046_Y_MIN       CONFIG_LVGL_TOUCH_Y_MIN
-#define XPT2046_X_MAX       CONFIG_LVGL_TOUCH_X_MAX
-#define XPT2046_Y_MAX       CONFIG_LVGL_TOUCH_Y_MAX
-#define XPT2046_X_INV       CONFIG_LVGL_TOUCH_INVERT_X
-#define XPT2046_Y_INV       CONFIG_LVGL_TOUCH_INVERT_Y
-
-static spi_device_handle_t xpt2046_spi;
-
 static void tp_spi_xchg(uint8_t data_send[], uint8_t data_recv[], uint8_t byte_count)
 {
     spi_transaction_t t = {
@@ -227,33 +238,29 @@ static void tp_spi_xchg(uint8_t data_send[], uint8_t data_recv[], uint8_t byte_c
     $(spi_device_transmit(xpt2046_spi, &t));
 }
 
-static int16_t avg_buf_x[XPT2046_AVG];
-static int16_t avg_buf_y[XPT2046_AVG];
-static uint8_t avg_last;
-
 static void xpt2046_init(void)
 {
-    configure_gpio(XPT2046_IRQ, GPIO_MODE_INPUT);
+    configure_gpio(config.irq, GPIO_MODE_INPUT);
 }
 
 static void xpt2046_corr(int16_t *x, int16_t *y)
 {
-    if (*x > XPT2046_X_MIN) {
-        *x -= XPT2046_X_MIN;
+    if (*x > config.x_min) {
+        *x -= config.x_min;
     }
     else {
         *x = 0;
     }
 
-    if (*y > XPT2046_Y_MIN) {
-        *y -= XPT2046_Y_MIN;
+    if (*y > config.y_min) {
+        *y -= config.y_min;
     }
     else {
         *y = 0;
     }
 
-    *x = (uint32_t)((uint32_t)*x * LV_HOR_RES) / (XPT2046_X_MAX - XPT2046_X_MIN);
-    *y = (uint32_t)((uint32_t)*y * LV_VER_RES) / (XPT2046_Y_MAX - XPT2046_Y_MIN);
+    *x = (uint32_t)((uint32_t)*x * LV_HOR_RES) / (config.x_max - config.x_min);
+    *y = (uint32_t)((uint32_t)*y * LV_VER_RES) / (config.y_max - config.y_min);
 
     *x =  LV_HOR_RES - *x;
     *y =  LV_VER_RES - *y;
@@ -295,7 +302,7 @@ static bool xpt2046_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
     int16_t x = 0;
     int16_t y = 0;
 
-    uint8_t data_ready = gpio_get_level(XPT2046_IRQ) == LOW;
+    uint8_t data_ready = gpio_get_level(config.irq) == LOW;
 
     if (data_ready) {
         uint8_t data_send[] = {
@@ -334,47 +341,46 @@ static bool xpt2046_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
 
 static void configure_shared_spi_bus()
 {
-    assert(TP_SPI_MOSI == DISP_SPI_MOSI);
-    assert(TP_SPI_CLK == DISP_SPI_CLK);
-
     spi_bus_config_t buscfg = {
-        .miso_io_num = TP_SPI_MISO,
-        .mosi_io_num = TP_SPI_MOSI,
-        .sclk_io_num = TP_SPI_CLK,
+        .miso_io_num = config.miso,
+        .mosi_io_num = config.mosi,
+        .sclk_io_num = config.clk,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
         .max_transfer_sz = DISP_BUF_SIZE * 2,
     };
 
-    $(spi_bus_initialize(HSPI_HOST, &buscfg, 1));
+    $(spi_bus_initialize(config.spi_host, &buscfg, 1));
 
     spi_device_interface_config_t ili9341_config = {
         .clock_speed_hz = 20 * 1000 * 1000,
         .mode = 0,
-        .spics_io_num = DISP_SPI_CS,
+        .spics_io_num = config.ili9341_cs,
         .queue_size = 1,
         .pre_cb = pre_cb,
         .post_cb = post_cb
     };
 
-    $(spi_bus_add_device(HSPI_HOST, &ili9341_config, &ili9341_spi));
-
+    $(spi_bus_add_device(config.spi_host, &ili9341_config, &ili9341_spi));
     ili9341_init();
 
     spi_device_interface_config_t xpt2046_config = {
         .clock_speed_hz = 2 * 1000 * 1000,
         .mode = 0,
-        .spics_io_num = TP_SPI_CS,
+        .spics_io_num = config.xpt2046_cs,
         .queue_size = 1,
         .pre_cb = NULL,
         .post_cb = NULL,
     };
 
-    $(spi_bus_add_device(HSPI_HOST, &xpt2046_config, &xpt2046_spi));
+    $(spi_bus_add_device(config.spi_host, &xpt2046_config, &xpt2046_spi));
     xpt2046_init();
 }
 
-void app_main() {
+void eli_ili9341_xpt2046_initialize(eli_ili9341_xpt2046_config_t *new_config)
+{
+    config = *new_config;
+
     lv_init();
 
     configure_shared_spi_bus();
@@ -396,6 +402,33 @@ void app_main() {
     lv_indev_drv_register(&indev_drv);
 
     esp_register_freertos_tick_hook(lv_tick_task);
+}
+
+#include "lv_examples/lv_apps/demo/demo.h"
+
+void app_main()
+{
+    assert(CONFIG_LVGL_TOUCH_SPI_MOSI == CONFIG_LVGL_DISP_SPI_MOSI);
+    assert(CONFIG_LVGL_TOUCH_SPI_CLK == CONFIG_LVGL_DISP_SPI_CLK);
+
+    eli_ili9341_xpt2046_config_t new_config = {
+        .mosi = CONFIG_LVGL_TOUCH_SPI_MOSI,
+        .clk = CONFIG_LVGL_TOUCH_SPI_CLK,
+        .ili9341_cs = CONFIG_LVGL_DISP_SPI_CS,
+        .xpt2046_cs = CONFIG_LVGL_TOUCH_SPI_CS,
+        .dc = CONFIG_LVGL_DISP_PIN_DC,
+        .rst = CONFIG_LVGL_DISP_PIN_RST,
+        .bckl = CONFIG_LVGL_DISP_PIN_BCKL,
+        .miso = CONFIG_LVGL_TOUCH_SPI_MISO,
+        .irq = CONFIG_LVGL_TOUCH_PIN_IRQ,
+        .x_min = CONFIG_LVGL_TOUCH_X_MIN,
+        .y_min = CONFIG_LVGL_TOUCH_Y_MIN,
+        .x_max = CONFIG_LVGL_TOUCH_X_MAX,
+        .y_max = CONFIG_LVGL_TOUCH_Y_MAX,
+        .spi_host = HSPI_HOST,
+    };
+
+    eli_ili9341_xpt2046_initialize(&new_config);
 
     demo_create();
 
