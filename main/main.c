@@ -40,15 +40,17 @@ typedef struct {
 
 static spi_device_handle_t ili9341_spi;
 
-static void configure_gpio_output(uint8_t pin)
+static void configure_gpio(uint8_t pin, gpio_mode_t mode)
 {
-    gpio_config_t io_conf;
-    io_conf.intr_type = GPIO_PIN_INTR_DISABLE;
-    io_conf.mode = GPIO_MODE_OUTPUT;
-    io_conf.pin_bit_mask = 1 << pin;
-    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-    gpio_config(&io_conf);
+    gpio_config_t io_conf = {
+        .pin_bit_mask = 1UL << pin,
+        .mode = mode,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .intr_type = GPIO_PIN_INTR_DISABLE,
+    };
+    esp_err_t ret = gpio_config(&io_conf);
+    assert(ret == ESP_OK);
 }
 
 static void IRAM_ATTR pre_cb(spi_transaction_t *trans)
@@ -139,9 +141,9 @@ static void ili9341_init(void)
     };
 
     //Initialize non-SPI GPIOs
-    configure_gpio_output(ILI9341_DC);
-    configure_gpio_output(ILI9341_RST);
-    configure_gpio_output(ILI9341_BCKL);
+    configure_gpio(ILI9341_DC, GPIO_MODE_OUTPUT);
+    configure_gpio(ILI9341_RST, GPIO_MODE_OUTPUT);
+    configure_gpio(ILI9341_BCKL, GPIO_MODE_OUTPUT);
 
     //Reset the display
     gpio_set_level(ILI9341_RST, 0);
@@ -241,16 +243,7 @@ static uint8_t avg_last;
 
 static void xpt2046_init(void)
 {
-    gpio_config_t irq_config = {
-        .pin_bit_mask = 1UL << XPT2046_IRQ,
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-
-    esp_err_t ret = gpio_config(&irq_config);
-    assert(ret == ESP_OK);
+    configure_gpio(XPT2046_IRQ, GPIO_MODE_INPUT);
 }
 
 static void xpt2046_corr(int16_t * x, int16_t * y)
